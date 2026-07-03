@@ -1,0 +1,35 @@
+{
+  "name": "supermarket-system",
+  "version": "3.0.0",
+  "description": "نظام إدارة سوبر ماركت متكامل مع التقارير المتقدمة والإشعارات",
+  "main": "backend/server.js",
+  "scripts": {
+    "start": "node backend/server.js",
+    "dev": "nodemon backend/server.js",
+    "backup": "node backend/backup.js",
+    "build": "echo 'No build process needed'"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.22.0",
+    "jsonwebtoken": "^9.0.2",
+    "moment": "^2.30.1",
+    "multer": "^2.0.2",
+    "sqlite3": "^5.1.7",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "supermarket",
+    "management",
+    "pos",
+    "inventory",
+    "reports",
+    "analytics"
+  ],
+  "author": "Supermarket Team",
+  "license": "MIT"
+}
