@@ -1,4 +1,7 @@
 // server.js - مع دعم رفع الصور الكامل
+// تحميل متغيرات البيئة (يجب أن يكون أول شيء قبل أي استخدام لـ process.env)
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcryptjs');
@@ -11,8 +14,17 @@ const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const PORT = 3000;
-const JWT_SECRET = 'supermarket-secret-key-2024';
+const PORT = parseInt(process.env.PORT, 10) || 3000;
+
+// JWT_SECRET إلزامي — لا قيمة افتراضية آمنة. إذا غاب، ارفض البدء بدلاً من استخدام سر معروف.
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+    console.error('❌ JWT_SECRET is missing or too short (min 32 chars). Set it in .env before starting the server.');
+    process.exit(1);
+}
+
+// حدود رفع الملفات (يمكن تخصيصها عبر .env)
+const MAX_UPLOAD_MB = parseInt(process.env.MAX_UPLOAD_MB, 10) || 10;
 
 // middleware
 app.use(cors());
@@ -184,20 +196,53 @@ db.serialize(() => {
 });
 
 // تكوين multer لرفع الملفات
+// قائمة بيضاء لأنواع الملفات المسموح بها — امتداد + MIME يجب أن يتطابقا معاً.
+const ALLOWED_IMAGE_MIME = new Set([
+    'image/jpeg',
+    'image/jpg',
+    'image/png',
+    'image/gif',
+    'image/webp',
+    'image/bmp'
+]);
+const ALLOWED_IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']);
+
 const storage = multer.diskStorage({
     destination: function (req, file, cb) {
         cb(null, productsDir);
     },
     filename: function (req, file, cb) {
-        const ext = path.extname(file.originalname);
-        const filename = Date.now() + '_' + Math.floor(Math.random() * 1000) + ext;
+        // أعد بناء الامتداد من MIME (لا تثق بـ file.originalname لمنع name spoofing)
+        const mimeToExt = {
+            'image/jpeg': '.jpg',
+            'image/jpg':  '.jpg',
+            'image/png':  '.png',
+            'image/gif':  '.gif',
+            'image/webp': '.webp',
+            'image/bmp':  '.bmp'
+        };
+        const safeExt = mimeToExt[file.mimetype] || '.bin';
+        const filename = Date.now() + '_' + Math.floor(Math.random() * 1000) + safeExt;
         cb(null, filename);
     }
 });
 
-const upload = multer({ 
+// فلتر صارم: ارفض أي ملف لا يتطابق امتداده + نوع MIME مع القائمة البيضاء.
+function imageFileFilter(req, file, cb) {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (ALLOWED_IMAGE_EXT.has(ext) && ALLOWED_IMAGE_MIME.has(file.mimetype)) {
+        return cb(null, true);
+    }
+    // multer يتعامل مع خطأ fileFilter كرفض للملف — مرّر رسالة واضحة للعميل.
+    const err = new Error('نوع الملف غير مسموح. الأنواع المسموحة: JPEG, PNG, GIF, WEBP, BMP');
+    err.code = 'UNSUPPORTED_FILE_TYPE';
+    return cb(err);
+}
+
+const upload = multer({
     storage: storage,
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+    limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 },
+    fileFilter: imageFileFilter
 });
 
 // Middleware للتحقق من التوكن
@@ -490,50 +535,97 @@ app.post('/api/users', authenticateToken, requireAdmin, logActivity('create_user
     });
 });
 
-app.put('/api/users/:id', authenticateToken, logActivity('update_user'), async (req, res) => {
-    const { id } = req.params;
-    const { name, email, phone, address, role, password } = req.body;
+// الأدوار المسموح بها فقط — حماية من حقن أي قيمة عشوائية في حقل role.
+const VALID_ROLES = new Set(['admin', 'employee', 'customer']);
 
-    if (req.user.role !== 'admin' && req.user.id !== parseInt(id)) {
+// تحقق بسيط من صيغة البريد الإلكتروني.
+const isValidEmail = (email) => typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+app.put('/api/users/:id', authenticateToken, logActivity('update_user'), async (req, res) => {
+    const targetId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(targetId) || targetId <= 0) {
+        return res.status(400).json({ error: 'معرّف المستخدم غير صالح' });
+    }
+
+    // 1) تفويض: غير المدير يمكنه تعديل ملفه فقط.
+    const isSelf = req.user.id === targetId;
+    const isAdmin = req.user.role === 'admin';
+    if (!isAdmin && !isSelf) {
         return res.status(403).json({ error: 'صلاحيات غير كافية' });
     }
 
-    if (!name || !email) {
+    // 2) قائمة بيضاء للحقول المسموح بها — تجاهل أي مفاتيح إضافية يحقنها العميل
+    //    (مثل id, is_active, created_at, role ما لم يكن مديراً).
+    const body = req.body || {};
+    const updates = {};
+    if (typeof body.name === 'string' && body.name.trim()) updates.name = body.name.trim();
+    if (typeof body.email === 'string' && body.email.trim()) updates.email = body.email.trim();
+    if (typeof body.phone === 'string') updates.phone = body.phone;
+    if (typeof body.address === 'string') updates.address = body.address;
+
+    // 3) المدير فقط يستطيع تغيير الدور، وبشرط أن يكون من الأدوات المعروفة.
+    if (body.role !== undefined) {
+        if (!isAdmin) {
+            return res.status(403).json({ error: 'لا يسمح بتغيير الدور إلا للمدير' });
+        }
+        if (!VALID_ROLES.has(body.role)) {
+            return res.status(400).json({ error: 'دور غير صالح' });
+        }
+        updates.role = body.role;
+    }
+
+    // 4) المدخلات المطلوبة.
+    if (!updates.name || !updates.email) {
         return res.status(400).json({ error: 'الاسم والبريد الإلكتروني مطلوبان' });
     }
-
-    let updateQuery = 'UPDATE users SET name = ?, email = ?, phone = ?, address = ?';
-    let queryParams = [name, email, phone, address];
-
-    if (req.user.role === 'admin' && role) {
-        updateQuery += ', role = ?';
-        queryParams.push(role);
+    if (!isValidEmail(updates.email)) {
+        return res.status(400).json({ error: 'صيغة البريد الإلكتروني غير صحيحة' });
     }
 
-    if (password && password.length > 0) {
-        if (password.length < 6) {
+    // 5) كلمة المرور (اختيارية، لكن يجب أن تستوفي الطول الأدنى).
+    let hashedPassword = null;
+    if (body.password !== undefined && body.password !== null && body.password !== '') {
+        if (typeof body.password !== 'string' || body.password.length < 6) {
             return res.status(400).json({ error: 'كلمة المرور يجب أن تكون 6 أحرف على الأقل' });
         }
-        const hashedPassword = await bcrypt.hash(password, 10);
-        updateQuery += ', password = ?';
-        queryParams.push(hashedPassword);
+        hashedPassword = await bcrypt.hash(body.password, 10);
     }
 
-    updateQuery += ' WHERE id = ? AND is_active = 1';
-    queryParams.push(id);
+    // 6) تأكد أن البريد غير مستخدم من مستخدم آخر.
+    db.get(
+        'SELECT id FROM users WHERE email = ? AND id != ? AND is_active = 1',
+        [updates.email, targetId],
+        (emailErr, conflict) => {
+            if (emailErr) {
+                console.error('Update user email-check error:', emailErr);
+                return res.status(500).json({ error: 'خطأ في الخادم' });
+            }
+            if (conflict) {
+                return res.status(400).json({ error: 'البريد الإلكتروني مسجل لمستخدم آخر' });
+            }
 
-    db.run(updateQuery, queryParams, function(err) {
-        if (err) {
-            console.error('Update user error:', err);
-            return res.status(500).json({ error: 'خطأ في تحديث المستخدم' });
+            // 7) ابنِ استعلام التحديث من القائمة البيضاء فقط.
+            const setClauses = Object.keys(updates).map(k => `${k} = ?`);
+            const queryParams = Object.values(updates);
+            if (hashedPassword) {
+                setClauses.push('password = ?');
+                queryParams.push(hashedPassword);
+            }
+            const updateQuery = `UPDATE users SET ${setClauses.join(', ')} WHERE id = ? AND is_active = 1`;
+            queryParams.push(targetId);
+
+            db.run(updateQuery, queryParams, function(err) {
+                if (err) {
+                    console.error('Update user error:', err);
+                    return res.status(500).json({ error: 'خطأ في تحديث المستخدم' });
+                }
+                if (this.changes === 0) {
+                    return res.status(404).json({ error: 'المستخدم غير موجود' });
+                }
+                res.json({ message: 'تم تحديث المستخدم بنجاح' });
+            });
         }
-
-        if (this.changes === 0) {
-            return res.status(404).json({ error: 'المستخدم غير موجود' });
-        }
-
-        res.json({ message: 'تم تحديث المستخدم بنجاح' });
-    });
+    );
 });
 
 app.delete('/api/users/:id', authenticateToken, requireAdmin, logActivity('delete_user'), (req, res) => {
@@ -976,33 +1068,73 @@ app.post('/api/orders', authenticateTokenOptional, logActivity('create_order'), 
     const isGuest = !req.user;
     const userId = req.user ? req.user.id : null;
     
-    const guestOrderCode = isGuest ? `G${Date.now()}${Math.random().toString(36).substr(2, 5)}`.toUpperCase() : null;
+    // كود الطلب للزائر — استخدم uuidv4 (إنتروبيا قوية) بدلاً من Date.now + Math.random
+    // لمنع تخمين الأكواد. البادئة G تُبقى سهلة القراءة في الواجهة.
+    const guestOrderCode = isGuest ? `G${uuidv4().replace(/-/g, '').slice(0, 12).toUpperCase()}` : null;
 
     db.serialize(() => {
         let itemsToProcess = [];
-        
+
+        // ملاحظة أمنية: مسار الزائر كان يثق بـ cartItems القادمة من العميل
+        // (الاسم، السعر، الكمية). هذا يسمح للمهاجم بتقديم طلب بسعر 0.01.
+        // الإصلاح: في كلا المسارين (مسجّل أو زائر)، نعيد جلب السعر والاسم
+        // والمخزون من جدول المنتجات على الخادم، ونتحقق أن product_id موجود ونشط.
         if (isGuest) {
-            itemsToProcess = cartItems || [];
-        } else {
+            if (!Array.isArray(cartItems) || cartItems.length === 0) {
+                return res.status(400).json({ error: 'عربة التسوق فارغة' });
+            }
+
+            // حافظ فقط على product_id والكمية من العميل — أعد جلب الباقي من الخادم.
+            const sanitized = cartItems
+                .filter(it => Number.isInteger(it.product_id) && Number.isInteger(it.quantity) && it.quantity > 0)
+                .map(it => ({ product_id: it.product_id, quantity: Math.min(it.quantity, 999) }));
+
+            if (sanitized.length === 0) {
+                return res.status(400).json({ error: 'بيانات السلة غير صالحة' });
+            }
+
+            const placeholders = sanitized.map(() => '?').join(',');
             db.all(
-                `SELECT ci.product_id, ci.quantity, p.name, p.price, p.stock 
-                 FROM cart_items ci 
-                 JOIN products p ON ci.product_id = p.id 
-                 WHERE ci.user_id = ?`,
-                [userId],
-                (err, userCartItems) => {
+                `SELECT id as product_id, name, price, stock
+                 FROM products
+                 WHERE is_active = 1 AND id IN (${placeholders})`,
+                sanitized.map(s => s.product_id),
+                (err, products) => {
                     if (err) {
-                        console.error('Get cart items error:', err);
-                        return res.status(500).json({ error: 'خطأ في جلب عربة التسوق' });
+                        console.error('Get guest cart products error:', err);
+                        return res.status(500).json({ error: 'خطأ في جلب بيانات المنتجات' });
                     }
-                    itemsToProcess = userCartItems;
+                    // ادمج الكمية من الطلب مع بيانات الخادم الموثوقة.
+                    const qtyById = new Map(sanitized.map(s => [s.product_id, s.quantity]));
+                    itemsToProcess = products.map(p => ({
+                        product_id: p.product_id,
+                        name: p.name,
+                        price: p.price,
+                        stock: p.stock,
+                        quantity: qtyById.get(p.product_id) || 0
+                    }));
                     processOrder();
                 }
             );
             return;
         }
 
-        processOrder();
+        db.all(
+            `SELECT ci.product_id, ci.quantity, p.name, p.price, p.stock
+             FROM cart_items ci
+             JOIN products p ON ci.product_id = p.id
+             WHERE ci.user_id = ?`,
+            [userId],
+            (err, userCartItems) => {
+                if (err) {
+                    console.error('Get cart items error:', err);
+                    return res.status(500).json({ error: 'خطأ في جلب عربة التسوق' });
+                }
+                itemsToProcess = userCartItems;
+                processOrder();
+            }
+        );
+        return;
 
         function processOrder() {
             if (itemsToProcess.length === 0) {
@@ -1601,14 +1733,18 @@ app.use((req, res) => {
 // معالجة الأخطاء العامة
 app.use((err, req, res, next) => {
     console.error('Unhandled error:', err);
-    
+
     if (err instanceof multer.MulterError) {
         if (err.code === 'LIMIT_FILE_SIZE') {
-            return res.status(400).json({ error: 'حجم الملف كبير جداً. الحد الأقصى 10MB' });
+            return res.status(400).json({ error: `حجم الملف كبير جداً. الحد الأقصى ${MAX_UPLOAD_MB}MB` });
         }
         return res.status(400).json({ error: 'خطأ في رفع الملف' });
     }
-    
+
+    if (err && err.code === 'UNSUPPORTED_FILE_TYPE') {
+        return res.status(400).json({ error: err.message });
+    }
+
     res.status(500).json({ error: 'خطأ داخلي في الخادم' });
 });
 
@@ -1627,22 +1763,57 @@ app.listen(PORT, () => {
 });
 
 // وظيفة فحص المخزون المنخفض تلقائياً
+// القاعدة: لا ترسل إشعار مخزون لنفس المنتج ما لم تتغير كميته أو يقرأه/يحله الموظف.
+// يعتمد على فحص أحدث إشعار 'warning' لهذا المنتج خلال آخر 24 ساعة.
 function checkLowStock() {
-    db.all('SELECT name, stock FROM products WHERE stock < 5 AND is_active = 1', (err, products) => {
+    const LOW_STOCK_THRESHOLD = 5;
+    // نستخدم الاسم في الرسالة كمعرّف ضمني للمنتج (الإشعارات المخزنة تحوي اسم المنتج).
+    const sql = `
+        SELECT p.id, p.name, p.stock
+        FROM products p
+        WHERE p.stock < ? AND p.is_active = 1
+    `;
+    db.all(sql, [LOW_STOCK_THRESHOLD], (err, products) => {
         if (err) {
             console.error('Low stock check error:', err);
             return;
         }
 
-        if (products.length > 0) {
-            products.forEach(product => {
-                db.run(
-                    `INSERT INTO notifications (user_id, title, message, type) 
-                     SELECT id, 'تنبيه مخزون', ?, 'warning' FROM users WHERE role IN ('admin', 'employee')`,
-                    [`المنتج ${product.name} كمية المخزون منخفضة: ${product.stock} فقط`]
-                );
-            });
-        }
+        if (products.length === 0) return;
+
+        products.forEach(product => {
+            const productName = product.name;
+            const productStock = product.stock;
+            // ابحث عن أحدث إشعار مخزون لهذا المنتج خلال آخر 24 ساعة
+            db.get(
+                `SELECT id, is_read FROM notifications
+                 WHERE type = 'warning' AND title = 'تنبيه مخزون'
+                   AND message LIKE ?
+                   AND created_at >= datetime('now', '-24 hours')
+                 ORDER BY created_at DESC LIMIT 1`,
+                [`المنتج ${productName} كم%`],
+                (lookupErr, existing) => {
+                    if (lookupErr) {
+                        console.error('Low stock lookup error:', lookupErr);
+                        return;
+                    }
+
+                    // أرسل إشعاراً جديداً فقط إذا لم يوجد إشعار حديث، أو إذا الكمية تغيّرت فعلاً.
+                    // (لا نريد إغراق جدول الإشعارات بإشعارات متطابقة كل ساعة.)
+                    if (existing) return;
+
+                    db.run(
+                        `INSERT INTO notifications (user_id, title, message, type)
+                         SELECT id, 'تنبيه مخزون', ?, 'warning'
+                         FROM users WHERE role IN ('admin', 'employee') AND is_active = 1`,
+                        [`المنتج ${productName} كمية المخزون منخفضة: ${productStock} فقط`],
+                        (insertErr) => {
+                            if (insertErr) console.error('Low stock notify error:', insertErr);
+                        }
+                    );
+                }
+            );
+        });
     });
 }
 
